@@ -60,7 +60,9 @@
  * CÓMO SE EJECUTA:
  *  - `diagnosticarAnual`: no genera nada; lista qué archivos encontró y
  *    cuántas filas/fechas lee de cada uno.
- *  - `generarExcelAnual`: genera el .xlsx.
+ *  - `generarExcelAnual`: inicia (o continúa, si hay uno a medias) el proceso
+ *    que genera el .xlsx. Se continúa solo por triggers hasta terminar; puedes
+ *    seguir el avance en Ejecuciones.
  *  - `crearTriggerAnualSemanal` (opcional, correr UNA vez): lo ejecuta solo
  *    cada lunes.
  *
@@ -69,9 +71,28 @@
  * de Apps Script que asistencia.js sin chocar nombres (main, CONFIG,
  * parseFecha, onOpen, etc.).
  *
- * NOTA DE RENDIMIENTO: Apps Script corta la ejecución a los 6 minutos. Abrir
- * cada archivo cuesta unos segundos, así que conviene exportar de Buk por
- * mes o por rango (unos pocos archivos grandes) en vez de un archivo por día.
+ * PROCESAMIENTO POR LOTES (mismo esquema que SN/main.js):
+ *  Apps Script corta cada ejecución a los 6 minutos, y con los reportes de
+ *  todo el año eso no alcanza. Por eso el proceso avanza por paquetes:
+ *   1. La primera ejecución lista los archivos y guarda el estado
+ *      ("leyendo", "generando").
+ *   2. Lee archivo por archivo, acumulando los datos. Antes de cada archivo
+ *      revisa el tiempo; al llegar a LIMITE_SEGUNDOS guarda el avance y
+ *      programa un trigger de continuación a 1 minuto (`continuarExcelAnual`).
+ *   3. Cuando ya leyó todo, genera el Excel (si ya no queda tiempo en esa
+ *      ejecución, lo deja para la siguiente continuación) y limpia el estado
+ *      y el trigger de continuación.
+ *  Como PropertiesService solo admite ~9 KB por valor, en Properties se
+ *  guarda solo el estado y el ID de un archivo JSON de trabajo
+ *  ("_estado_asistencia_anual (no borrar).json", en la carpeta de salida)
+ *  que contiene la lista de archivos, el índice y los datos acumulados. Ese
+ *  JSON se manda a la papelera al terminar.
+ *  - Si un archivo no se puede leer, se registra el error, se salta y se
+ *    sigue con el siguiente (se lista al final en el log y en el correo).
+ *  - Si el estado queda a medias por más de HORAS_EXPIRACION_ESTADO, o está
+ *    corrupto, la siguiente ejecución lo descarta y empieza de cero.
+ *  - `reiniciarExcelAnual`: función de emergencia que limpia el estado, el
+ *    JSON de trabajo y el trigger de continuación.
  ******************************************************************************/
 
 // ============================================================================
@@ -102,7 +123,16 @@ var CONFIG_ANUAL = {
   CORREOS: [
     'ccarbajal@abcsc.mx'
   ],
-  ASUNTO_CORREO: 'Asistencia anual'
+  ASUNTO_CORREO: 'Asistencia anual',
+  // --- Procesamiento por lotes ---
+  // Segundos de lectura por ejecución antes de guardar y programar la
+  // continuación (el tope de Apps Script es 360).
+  LIMITE_SEGUNDOS: 270,
+  // Si al terminar de leer ya pasaron más de estos segundos, la generación
+  // del Excel se deja para la siguiente ejecución (necesita su propio tiempo).
+  LIMITE_SEGUNDOS_PARA_GENERAR: 150,
+  // Un proceso a medias más viejo que esto se descarta y se empieza de cero.
+  HORAS_EXPIRACION_ESTADO: 24
 };
 
 // ============================================================================
@@ -110,7 +140,18 @@ var CONFIG_ANUAL = {
 // ============================================================================
 
 function generarExcelAnual() {
-  AsistenciaAnual.generar();
+  AsistenciaAnual.ejecutar();
+}
+
+// Handler del trigger de continuación (no la corras a mano, usa
+// generarExcelAnual; hacen lo mismo).
+function continuarExcelAnual() {
+  AsistenciaAnual.ejecutar();
+}
+
+// Función de emergencia: descarta el proceso a medias.
+function reiniciarExcelAnual() {
+  AsistenciaAnual.reiniciar();
 }
 
 function diagnosticarAnual() {
@@ -185,39 +226,214 @@ var AsistenciaAnual = (function () {
     'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
 
   // ==========================================================================
-  // GENERAR
+  // ORQUESTACIÓN POR LOTES
   // ==========================================================================
 
-  function generar() {
-    var t0 = new Date();
-    var carpetaEntrada = DriveApp.getFolderById(CONFIG_ANUAL.ID_CARPETA_ENTRADA_ANUAL);
+  var PROP = {
+    ESTADO: 'AA_estado',             // 'leyendo' | 'generando'
+    ARCHIVO_ESTADO: 'AA_archivoEstadoId',
+    INICIADO: 'AA_iniciado'
+  };
+  var HANDLER_CONTINUACION = 'continuarExcelAnual';
+  var NOMBRE_ARCHIVO_ESTADO = '_estado_asistencia_anual (no borrar).json';
+
+  function ejecutar() {
+    var lock = LockService.getScriptLock();
+    if (!lock.tryLock(1000)) {
+      Logger.log('Ya hay otra ejecución del reporte anual en curso; se omite esta.');
+      return;
+    }
+    try {
+      ejecutarConLock(new Date().getTime());
+    } finally {
+      lock.releaseLock();
+    }
+  }
+
+  function ejecutarConLock(inicio) {
+    var props = PropertiesService.getScriptProperties();
     var carpetaSalida = DriveApp.getFolderById(CONFIG_ANUAL.ID_CARPETA_SALIDA_ANUAL);
 
+    var estado = cargarEstado(props);
+    if (!estado) estado = inicializarEstado(props, carpetaSalida);
+    if (!estado) return;
+
+    if (props.getProperty(PROP.ESTADO) === 'leyendo') {
+      var terminoLectura = procesarLote(estado, inicio);
+      if (!terminoLectura) {
+        guardarEstado(props, carpetaSalida, estado);
+        programarContinuacion();
+        return;
+      }
+      props.setProperty(PROP.ESTADO, 'generando');
+      var transcurrido = (new Date().getTime() - inicio) / 1000;
+      if (transcurrido >= CONFIG_ANUAL.LIMITE_SEGUNDOS_PARA_GENERAR) {
+        Logger.log('Lectura terminada, pero quedan pocos segundos en esta ejecución (' +
+          Math.round(transcurrido) + 's). La generación del Excel sigue en la próxima continuación.');
+        guardarEstado(props, carpetaSalida, estado);
+        programarContinuacion();
+        return;
+      }
+    }
+
+    generarReporteFinal(estado, carpetaSalida);
+    cancelarTriggersContinuacion();
+    limpiarEstado(props);
+  }
+
+  // Devuelve el estado guardado, o null si no hay (o si estaba corrupto o
+  // expirado, en cuyo caso lo limpia).
+  function cargarEstado(props) {
+    var fase = props.getProperty(PROP.ESTADO);
+    if (!fase) return null;
+
+    var iniciado = props.getProperty(PROP.INICIADO);
+    var horas = iniciado ? (new Date() - new Date(iniciado)) / 3600000 : Infinity;
+    if (horas > CONFIG_ANUAL.HORAS_EXPIRACION_ESTADO) {
+      Logger.log('Aviso: había un proceso a medias iniciado el ' + iniciado + ' (hace más de ' +
+        CONFIG_ANUAL.HORAS_EXPIRACION_ESTADO + 'h). Se descarta y se empieza de cero.');
+      limpiarEstado(props);
+      return null;
+    }
+
+    try {
+      var archivo = DriveApp.getFileById(props.getProperty(PROP.ARCHIVO_ESTADO));
+      var estado = JSON.parse(archivo.getBlob().getDataAsString());
+      if (!estado || !Array.isArray(estado.lista) || typeof estado.indice !== 'number' || !estado.acc) {
+        throw new Error('estructura inválida');
+      }
+      Logger.log('Continuando proceso iniciado el ' + iniciado + ' (fase "' + fase + '", archivo ' +
+        estado.indice + ' de ' + estado.lista.length + ').');
+      return estado;
+    } catch (e) {
+      Logger.log('Aviso: estado corrupto o archivo de trabajo inaccesible (' + e.message + '). Reiniciando automáticamente...');
+      limpiarEstado(props);
+      return null;
+    }
+  }
+
+  function inicializarEstado(props, carpetaSalida) {
+    var carpetaEntrada = DriveApp.getFolderById(CONFIG_ANUAL.ID_CARPETA_ENTRADA_ANUAL);
     var archivos = localizarArchivos(carpetaEntrada, true);
 
-    var tablaAsistencias = cargarVarias(archivos.asistencias);
-    var tablaInasistencias = cargarVarias(archivos.inasistencias);
-    var tablaFallidos = cargarVarias(archivos.fallidos);
-    var roster = cargarMaestro(archivos.maestro);
-    var festivos = archivos.calendario ? cargarFestivos(archivos.calendario) : new Set();
+    var lista = []
+      .concat(archivos.asistencias.map(function (f) { return { id: f.getId(), nombre: f.getName(), tipo: 'asistencia' }; }))
+      .concat(archivos.fallidos.map(function (f) { return { id: f.getId(), nombre: f.getName(), tipo: 'fallido' }; }))
+      .concat(archivos.inasistencias.map(function (f) { return { id: f.getId(), nombre: f.getName(), tipo: 'inasistencia' }; }));
 
-    Logger.log('Asistencias: ' + tablaAsistencias.rows.length + ' filas de ' + archivos.asistencias.length + ' archivo(s).');
-    Logger.log('Inasistencias: ' + tablaInasistencias.rows.length + ' filas de ' + archivos.inasistencias.length + ' archivo(s).');
-    Logger.log('Registros fallidos: ' + tablaFallidos.rows.length + ' filas de ' + archivos.fallidos.length + ' archivo(s).');
+    var estado = {
+      lista: lista,
+      indice: 0,
+      maestroId: archivos.maestro.getId(),
+      calendarioId: archivos.calendario ? archivos.calendario.getId() : null,
+      errores: [],
+      filas: { asistencia: 0, fallido: 0, inasistencia: 0 },
+      acc: nuevoAcumulado()
+    };
+
+    props.setProperty(PROP.INICIADO, new Date().toISOString());
+    props.setProperty(PROP.ESTADO, 'leyendo');
+    guardarEstado(props, carpetaSalida, estado);
+    Logger.log('Estado inicializado. Archivos por leer: ' + lista.length);
+    return estado;
+  }
+
+  // Lee archivos desde estado.indice hasta terminar o hasta llegar al límite
+  // de tiempo. Devuelve true si ya leyó todos.
+  function procesarLote(estado, inicio) {
+    var total = estado.lista.length;
+    Logger.log('▶ Leyendo desde el archivo ' + (estado.indice + 1) + ' de ' + total);
+
+    while (estado.indice < total) {
+      var transcurrido = (new Date().getTime() - inicio) / 1000;
+      if (transcurrido >= CONFIG_ANUAL.LIMITE_SEGUNDOS) {
+        Logger.log('⏱ Límite de tiempo alcanzado (' + Math.round(transcurrido) + 's). Se guarda el avance en el archivo ' +
+          estado.indice + ' de ' + total + '.');
+        return false;
+      }
+
+      var item = estado.lista[estado.indice];
+      try {
+        var tabla = cargarTabla(DriveApp.getFileById(item.id));
+        acumularTabla(estado.acc, item.tipo, tabla, CONFIG_ANUAL.TOLERANCIA_RETARDO_MIN);
+        estado.filas[item.tipo] += tabla.rows.length;
+      } catch (e) {
+        Logger.log('⚠️ Error leyendo "' + item.nombre + '": ' + e.message + '. Se omite y se sigue con el siguiente.');
+        estado.errores.push(item.nombre + ': ' + e.message);
+      }
+      estado.indice++;
+    }
+
+    Logger.log('✅ Lectura completa. Filas -> asistencias: ' + estado.filas.asistencia +
+      ', registros fallidos: ' + estado.filas.fallido + ', inasistencias: ' + estado.filas.inasistencia +
+      (estado.errores.length ? ('. Archivos con error: ' + estado.errores.length) : ''));
+    return true;
+  }
+
+  // Guarda el estado en un JSON nuevo de la carpeta de salida y manda el
+  // anterior a la papelera (se crea uno nuevo en vez de sobrescribir para no
+  // depender del límite de tamaño de setContent).
+  function guardarEstado(props, carpetaSalida, estado) {
+    var anteriorId = props.getProperty(PROP.ARCHIVO_ESTADO);
+    var nuevo = carpetaSalida.createFile(
+      Utilities.newBlob(JSON.stringify(estado), 'application/json', NOMBRE_ARCHIVO_ESTADO));
+    props.setProperty(PROP.ARCHIVO_ESTADO, nuevo.getId());
+    if (anteriorId) {
+      try { DriveApp.getFileById(anteriorId).setTrashed(true); } catch (e) { /* ya no existe */ }
+    }
+  }
+
+  function limpiarEstado(props) {
+    var archivoId = props.getProperty(PROP.ARCHIVO_ESTADO);
+    if (archivoId) {
+      try { DriveApp.getFileById(archivoId).setTrashed(true); } catch (e) { /* ya no existe */ }
+    }
+    props.deleteProperty(PROP.ESTADO);
+    props.deleteProperty(PROP.ARCHIVO_ESTADO);
+    props.deleteProperty(PROP.INICIADO);
+    Logger.log('🧹 Estado del reporte anual limpiado.');
+  }
+
+  function programarContinuacion() {
+    cancelarTriggersContinuacion();
+    ScriptApp.newTrigger(HANDLER_CONTINUACION).timeBased().after(60 * 1000).create();
+    Logger.log('⏰ Trigger de continuación programado en 1 minuto.');
+  }
+
+  // Solo borra los triggers de continuación; el trigger semanal
+  // (generarExcelAnual) no se toca.
+  function cancelarTriggersContinuacion() {
+    ScriptApp.getProjectTriggers().forEach(function (t) {
+      if (t.getHandlerFunction() === HANDLER_CONTINUACION &&
+          t.getEventType() === ScriptApp.EventType.CLOCK) {
+        ScriptApp.deleteTrigger(t);
+      }
+    });
+  }
+
+  function reiniciar() {
+    limpiarEstado(PropertiesService.getScriptProperties());
+    cancelarTriggersContinuacion();
+    Logger.log('🔄 Listo. Puedes volver a ejecutar generarExcelAnual().');
+  }
+
+  // ==========================================================================
+  // GENERAR EL EXCEL (con todos los archivos ya leídos)
+  // ==========================================================================
+
+  function generarReporteFinal(estado, carpetaSalida) {
+    var t0 = new Date();
+    var acc = estado.acc;
+    var roster = cargarMaestro(DriveApp.getFileById(estado.maestroId));
+    var festivos = estado.calendarioId ? cargarFestivos(DriveApp.getFileById(estado.calendarioId)) : new Set();
     Logger.log('Maestro: ' + roster.length + ' personas. Festivos: ' + festivos.size + ' fechas.');
 
     // --- Año y rango de fechas ---
-    var todasFechas = []
-      .concat(tablaAsistencias.rows.map(function (r) { return parseFecha(r['Fecha Entrada']); }))
-      .concat(tablaInasistencias.rows.map(function (r) { return parseFecha(r['Día']); }))
-      .concat(tablaFallidos.rows.map(function (r) { return parseFecha(r['Fecha intento']); }))
-      .filter(Boolean);
+    var todasFechas = uniqueSorted(Object.keys(acc.asis).concat(Object.keys(acc.fall)).concat(Object.keys(acc.inas)));
     if (todasFechas.length === 0) {
       Logger.log('No se encontraron fechas válidas en los reportes. Nada que hacer.');
       return;
     }
-    todasFechas = uniqueSorted(todasFechas);
-
     var anio = CONFIG_ANUAL.ANIO || +todasFechas[todasFechas.length - 1].substring(0, 4);
     var prefijoAnio = anio + '-';
     var fechasDelAnio = todasFechas.filter(function (f) { return f.indexOf(prefijoAnio) === 0; });
@@ -229,16 +445,10 @@ var AsistenciaAnual = (function () {
     var fechas = rangoDeFechas(anio + '-01-01', fechaFin);
     Logger.log('Año ' + anio + ': ' + fechas[0] + ' a ' + fechaFin + ' (' + fechas.length + ' días).');
 
-    // --- Estatus diario ---
-    var res = construirDatosPorFecha(tablaAsistencias, tablaInasistencias, tablaFallidos,
-      CONFIG_ANUAL.TOLERANCIA_RETARDO_MIN, prefijoAnio);
-
-    // --- Roster final (maestro + personas fuera de maestro si aplica) ---
-    var personas = construirPersonas(roster, res);
+    var datos = resolverDatos(acc, prefijoAnio);
+    var personas = construirPersonas(roster, acc, datos);
     Logger.log('Personas en el reporte: ' + personas.length);
-
-    // --- Matriz final ---
-    var matriz = construirMatriz(personas, fechas, festivos, res.datos);
+    var matriz = construirMatriz(personas, fechas, festivos, datos);
 
     // --- Escribir en Sheet temporal y exportar a Excel ---
     var nombre = CONFIG_ANUAL.NOMBRE_ARCHIVO.replace('{ANIO}', anio);
@@ -247,9 +457,9 @@ var AsistenciaAnual = (function () {
     try {
       escribirReporteAnual(ssTmp, personas, fechas, matriz);
       escribirResumen(ssTmp, personas, fechas, matriz);
-      escribirTabla(ssTmp, HOJAS.FALTAS, columnasFaltas(), listaFaltas(personas, fechas, matriz, res.datos), COLOR_FALTA);
-      escribirTabla(ssTmp, HOJAS.RETARDOS, columnasRetardos(), listaRetardos(personas, fechas, matriz, res.datos), null);
-      escribirTabla(ssTmp, HOJAS.FALLIDOS, columnasFallidos(), listaFallidos(personas, fechas, matriz, res.datos), COLOR_FALLIDO);
+      escribirTabla(ssTmp, HOJAS.FALTAS, columnasFaltas(), listaFaltas(personas, fechas, matriz, datos), COLOR_FALTA);
+      escribirTabla(ssTmp, HOJAS.RETARDOS, columnasRetardos(), listaRetardos(personas, fechas, matriz, datos), null);
+      escribirTabla(ssTmp, HOJAS.FALLIDOS, columnasFallidos(), listaFallidos(personas, fechas, matriz, datos), COLOR_FALLIDO);
       escribirLeyenda(ssTmp);
       // Quita la "Hoja 1" vacía que crea SpreadsheetApp.create()
       ssTmp.getSheets().forEach(function (sh) {
@@ -263,11 +473,14 @@ var AsistenciaAnual = (function () {
       DriveApp.getFileById(ssTmp.getId()).setTrashed(true);
     }
 
-    Logger.log('Listo. Excel generado: ' + archivoXlsx.getName() + ' -> ' + archivoXlsx.getUrl());
-    Logger.log('Tiempo total: ' + ((new Date() - t0) / 1000) + 's');
+    if (estado.errores.length) {
+      Logger.log('⚠️ Archivos que no se pudieron leer (' + estado.errores.length + '): ' + estado.errores.join(' | '));
+    }
+    Logger.log('🎉 Listo. Excel generado: ' + archivoXlsx.getName() + ' -> ' + archivoXlsx.getUrl());
+    Logger.log('Tiempo de generación: ' + ((new Date() - t0) / 1000) + 's');
 
     if (CONFIG_ANUAL.ENVIAR_CORREO) {
-      enviarCorreo(anio, fechas, personas, matriz, archivoXlsx);
+      enviarCorreo(anio, fechas, personas, matriz, archivoXlsx, estado.errores);
     }
   }
 
@@ -276,18 +489,12 @@ var AsistenciaAnual = (function () {
   }
 
   // ==========================================================================
-  // DIAGNÓSTICO
+  // DIAGNÓSTICO (ligero: lista todo, pero solo abre el primer archivo de cada
+  // tipo para no chocar con el límite de 6 minutos)
   // ==========================================================================
 
   function diagnosticar() {
     var carpeta = DriveApp.getFolderById(CONFIG_ANUAL.ID_CARPETA_ENTRADA_ANUAL);
-    Logger.log('=== Archivos en la carpeta de entrada anual ===');
-    var it = carpeta.getFiles();
-    while (it.hasNext()) {
-      var f = it.next();
-      Logger.log('  "' + f.getName() + '"  (mimeType=' + f.getMimeType() + ')');
-    }
-
     var archivos = localizarArchivos(carpeta, false);
 
     function mostrar(etiqueta, file, colFecha) {
@@ -302,11 +509,16 @@ var AsistenciaAnual = (function () {
       }
     }
 
-    archivos.asistencias.forEach(function (f) { mostrar('Asistencias', f, 'Fecha Entrada'); });
-    archivos.inasistencias.forEach(function (f) { mostrar('Inasistencias', f, 'Día'); });
-    archivos.fallidos.forEach(function (f) { mostrar('Registro fallido', f, 'Fecha intento'); });
+    mostrar('Asistencias (1er archivo)', archivos.asistencias[0], 'Fecha Entrada');
+    mostrar('Inasistencias (1er archivo)', archivos.inasistencias[0], 'Día');
+    mostrar('Registro fallido (1er archivo)', archivos.fallidos[0], 'Fecha intento');
     mostrar('Maestro', archivos.maestro, null);
     Logger.log('Calendario: ' + (archivos.calendario ? archivos.calendario.getName() : 'NO ENCONTRADO (no se marcarán festivos)'));
+
+    var props = PropertiesService.getScriptProperties();
+    Logger.log('Proceso a medias: ' + (props.getProperty(PROP.ESTADO)
+      ? ('sí, fase "' + props.getProperty(PROP.ESTADO) + '", iniciado ' + props.getProperty(PROP.INICIADO))
+      : 'no'));
     Logger.log('=== Fin diagnóstico ===');
   }
 
@@ -603,113 +815,156 @@ var AsistenciaAnual = (function () {
   }
 
   // ==========================================================================
-  // CÁLCULO DEL ESTATUS DIARIO
+  // ACUMULADO DE DATOS (se llena archivo por archivo y se guarda en el JSON
+  // de trabajo entre ejecuciones, por eso usa arreglos compactos).
   //
-  // datos[fecha][rut] = {
-  //   codigo, comentario,
-  //   tipo: 'asistencia' | 'fallido' | 'inasistencia',
-  //   fila: fila fuente elegida, retardoMin: minutos brutos de diferencia
-  // }
+  //   asis[f][rut] = [codigo, retardoEfectivo, diferenciaMin, horaProg, horaReal,
+  //                   recinto, area, supervisor, sigla]
+  //   fall[f][rut] = [{detalle: true}, recinto, area, supervisor]
+  //   inas[f][rut] = [codigo, recinto, area, supervisor, contrato, horario, sigla]
+  //   horario[rut] = [fecha, horarioTurno]         (el más reciente)
+  //   fuente[rut]  = [fecha, nombre, area, recinto, supervisor] (el más reciente)
+  //
+  // Cada tipo guarda su mejor fila por RUT + fecha, así que el orden en que se
+  // leen los archivos no importa. Las reglas de prioridad se aplican al final,
+  // en resolverDatos().
   // ==========================================================================
+
+  function nuevoAcumulado() {
+    return { asis: {}, fall: {}, inas: {}, horario: {}, fuente: {}, motivosDesconocidos: {} };
+  }
+
+  function acumularTabla(acc, tipo, tabla, toleranciaMin) {
+    if (tipo === 'asistencia') tabla.rows.forEach(function (r) { acumularAsistencia(acc, r, toleranciaMin); });
+    else if (tipo === 'fallido') tabla.rows.forEach(function (r) { acumularFallido(acc, r); });
+    else tabla.rows.forEach(function (r) { acumularInasistencia(acc, r); });
+  }
+
+  function registrarFuente(acc, rut, f, row) {
+    if (!acc.fuente[rut] || acc.fuente[rut][0] <= f) {
+      acc.fuente[rut] = [f, nombreDeFila(row), row['Área'] || '', row['Recinto'] || '', row['Supervisor'] || ''];
+    }
+  }
+
+  function celda(mapa, f) { return (mapa[f] = mapa[f] || {}); }
+
+  function acumularAsistencia(acc, row, toleranciaMin) {
+    var f = parseFecha(row['Fecha Entrada']);
+    var rut = limpiarRut(row['RUT']);
+    if (!f || !rut) return;
+    registrarFuente(acc, rut, f, row);
+
+    var horarioTurno = String(row['Horario Turno'] || '').trim();
+    if (horarioTurno && horarioTurno !== '-' && (!acc.horario[rut] || acc.horario[rut][0] <= f)) {
+      acc.horario[rut] = [f, horarioTurno];
+    }
+
+    var rango = parseRangoHorario(row['Horario Turno']);
+    var horaReal = parseHora(row['Hora Entrada']);
+    var diferencia = (rango.inicio === null || horaReal === null) ? null : horaReal - rango.inicio;
+    var tarde = diferencia !== null && diferencia > toleranciaMin;
+    var codigo = tarde ? 'A-' + Math.round(diferencia - toleranciaMin) : 'A';
+    var retardoEfectivo = tarde ? diferencia : 0;
+
+    // Si checó en varios recintos el mismo día, se queda la checada con
+    // menos retardo.
+    var previo = celda(acc.asis, f)[rut];
+    if (previo && previo[1] <= retardoEfectivo) return;
+    acc.asis[f][rut] = [codigo, retardoEfectivo, diferencia, rango.inicio, horaReal,
+      row['Recinto'] || '', row['Área'] || '', row['Supervisor'] || '', row['Sigla Turno'] || ''];
+  }
+
+  function acumularFallido(acc, row) {
+    var f = parseFecha(row['Fecha intento']);
+    var rut = limpiarRut(row['RUT']);
+    if (!f || !rut) return;
+    registrarFuente(acc, rut, f, row);
+    var c = celda(acc.fall, f);
+    c[rut] = c[rut] || [{}, row['Recinto'] || '', row['Área'] || '', row['Supervisor'] || ''];
+    c[rut][0][describirIntento(row)] = true; // sin duplicados si los archivos se traslapan
+  }
+
+  function acumularInasistencia(acc, row) {
+    var f = parseFecha(row['Día']);
+    var rut = limpiarRut(row['RUT']);
+    if (!f || !rut) return;
+    registrarFuente(acc, rut, f, row);
+
+    var motivo = String(row['Motivo'] || '').trim();
+    var codigo = MOTIVO_A_CODIGO.hasOwnProperty(motivo) ? MOTIVO_A_CODIGO[motivo] : null;
+    if (codigo === null) {
+      acc.motivosDesconocidos[motivo] = (acc.motivosDesconocidos[motivo] || 0) + 1;
+      codigo = motivo || 'F';
+    }
+
+    // Varias inasistencias el mismo día (distintos recintos): cualquier
+    // justificación le gana a la falta sin justificar.
+    var previo = celda(acc.inas, f)[rut];
+    if (previo && (previo[0] !== 'F' || codigo === 'F')) return;
+    acc.inas[f][rut] = [codigo, row['Recinto'] || '', row['Área'] || '', row['Supervisor'] || '',
+      row['Contrato'] || '', row['Horario'] || '', row['Sigla Turno'] || ''];
+  }
 
   function describirIntento(row) {
     return ((row['Sentido'] || '') + ' ' + (row['Hora intento'] || '') + ' (' + (row['Error al marcar'] || '') + ')').trim();
   }
 
-  function construirDatosPorFecha(tablaAsistencias, tablaInasistencias, tablaFallidos, toleranciaMin, prefijoAnio) {
+  // ==========================================================================
+  // REGLAS DE PRIORIDAD -> datos[fecha][rut] = { codigo, comentario, tipo,
+  //   fila, retardoMin, horaProgramada, horaReal, detalle }
+  //   1. asistencia real (cualquier recinto)  2. intento fallido
+  //   3. motivo de inasistencia (F solo si ninguna fila está justificada)
+  // ==========================================================================
+
+  function resolverDatos(acc, prefijoAnio) {
     var datos = {};
-    var horario = {};      // horario[rut] = { fecha, valor } (el más reciente)
-    var infoFuente = {};   // infoFuente[rut] = fila más reciente (para personas fuera de maestro)
-
-    function registrarFuente(rut, f, row) {
-      if (!infoFuente[rut] || infoFuente[rut].fecha <= f) infoFuente[rut] = { fecha: f, fila: row };
+    var desconocidos = Object.keys(acc.motivosDesconocidos);
+    if (desconocidos.length) {
+      Logger.log('Aviso: motivos que no están en el catálogo (se dejan tal cual): ' +
+        desconocidos.map(function (m) { return '"' + m + '" x' + acc.motivosDesconocidos[m]; }).join(', '));
     }
-    function slot(f) { return (datos[f] = datos[f] || {}); }
 
-    // --- 1) Asistencias reales, en cualquier recinto: siempre ganan ---
-    tablaAsistencias.rows.forEach(function (row) {
-      var f = parseFecha(row['Fecha Entrada']);
-      var rut = limpiarRut(row['RUT']);
-      if (!f || !rut || f.indexOf(prefijoAnio) !== 0) return;
-      registrarFuente(rut, f, row);
+    function delAnio(mapa, fn) {
+      Object.keys(mapa).forEach(function (f) {
+        if (f.indexOf(prefijoAnio) !== 0) return;
+        Object.keys(mapa[f]).forEach(function (rut) {
+          datos[f] = datos[f] || {};
+          if (datos[f][rut]) return; // ya lo resolvió una regla de mayor prioridad
+          datos[f][rut] = fn(mapa[f][rut]);
+        });
+      });
+    }
 
-      var horarioTurno = String(row['Horario Turno'] || '').trim();
-      if (horarioTurno && horarioTurno !== '-' && (!horario[rut] || horario[rut].fecha <= f)) {
-        horario[rut] = { fecha: f, valor: horarioTurno };
-      }
-
-      var rango = parseRangoHorario(row['Horario Turno']);
-      var horaReal = parseHora(row['Hora Entrada']);
-      var diferencia = (rango.inicio === null || horaReal === null) ? null : horaReal - rango.inicio;
-      var codigo = (diferencia !== null && diferencia > toleranciaMin)
-        ? 'A-' + Math.round(diferencia - toleranciaMin) : 'A';
-      var retardoEfectivo = (diferencia !== null && diferencia > toleranciaMin) ? diferencia : 0;
-
-      var previo = slot(f)[rut];
-      // Si checó en varios recintos el mismo día, se queda la checada con
-      // menos retardo.
-      if (previo && previo.tipo === 'asistencia' && previo.retardoEfectivo <= retardoEfectivo) return;
-      datos[f][rut] = {
-        codigo: codigo, comentario: null, tipo: 'asistencia', fila: row,
-        retardoMin: diferencia, retardoEfectivo: retardoEfectivo,
-        horaProgramada: rango.inicio, horaReal: horaReal
+    delAnio(acc.asis, function (a) {
+      return {
+        codigo: a[0], comentario: null, tipo: 'asistencia',
+        retardoMin: a[2], horaProgramada: a[3], horaReal: a[4],
+        fila: { 'Recinto': a[5], 'Área': a[6], 'Supervisor': a[7], 'Sigla Turno': a[8] }
       };
     });
-
-    // --- 2) Intentos de checada fallidos: cuentan como asistencia si no hay
-    //        asistencia real ese día ---
-    var fallidos = {}; // fallidos[f][rut] = { detalles: {texto:true}, fila }
-    tablaFallidos.rows.forEach(function (row) {
-      var f = parseFecha(row['Fecha intento']);
-      var rut = limpiarRut(row['RUT']);
-      if (!f || !rut || f.indexOf(prefijoAnio) !== 0) return;
-      registrarFuente(rut, f, row);
-      fallidos[f] = fallidos[f] || {};
-      fallidos[f][rut] = fallidos[f][rut] || { detalles: {}, fila: row };
-      fallidos[f][rut].detalles[describirIntento(row)] = true; // sin duplicados si los archivos se traslapan
+    delAnio(acc.fall, function (x) {
+      var detalle = Object.keys(x[0]).join('; ');
+      return {
+        codigo: 'A', tipo: 'fallido', detalle: detalle,
+        comentario: 'Asistencia inferida por intento de checada fallido: ' + detalle,
+        fila: { 'Recinto': x[1], 'Área': x[2], 'Supervisor': x[3] }
+      };
     });
-    Object.keys(fallidos).forEach(function (f) {
-      Object.keys(fallidos[f]).forEach(function (rut) {
-        if (slot(f)[rut]) return; // ya tiene asistencia real
-        var detalle = Object.keys(fallidos[f][rut].detalles).join('; ');
-        datos[f][rut] = {
-          codigo: 'A', tipo: 'fallido', fila: fallidos[f][rut].fila, detalle: detalle,
-          comentario: 'Asistencia inferida por intento de checada fallido: ' + detalle
-        };
-      });
+    delAnio(acc.inas, function (i) {
+      return {
+        codigo: i[0], comentario: null, tipo: 'inasistencia',
+        fila: { 'Recinto': i[1], 'Área': i[2], 'Supervisor': i[3], 'Contrato': i[4], 'Horario': i[5], 'Sigla Turno': i[6] }
+      };
     });
-
-    // --- 3) Inasistencias: solo si no hubo asistencia real ni intento.
-    //        Si hay varias filas ese día (varios recintos), cualquier
-    //        justificación le gana a la falta sin justificar. ---
-    tablaInasistencias.rows.forEach(function (row) {
-      var f = parseFecha(row['Día']);
-      var rut = limpiarRut(row['RUT']);
-      if (!f || !rut || f.indexOf(prefijoAnio) !== 0) return;
-      registrarFuente(rut, f, row);
-
-      var previo = slot(f)[rut];
-      if (previo && previo.tipo !== 'inasistencia') return; // asistió o tuvo intento
-      if (previo && previo.codigo !== 'F') return;          // ya hay una justificación
-
-      var motivo = String(row['Motivo'] || '').trim();
-      var codigo = MOTIVO_A_CODIGO.hasOwnProperty(motivo) ? MOTIVO_A_CODIGO[motivo] : null;
-      if (codigo === null) {
-        Logger.log('Aviso: motivo "' + motivo + '" no está en el catálogo (RUT ' + rut + ', ' + f + '); se deja tal cual.');
-        codigo = motivo || 'F';
-      }
-      if (previo && codigo === 'F') return; // no se sobreescribe con otra F
-      datos[f][rut] = { codigo: codigo, comentario: null, tipo: 'inasistencia', fila: row };
-    });
-
-    return { datos: datos, horario: horario, infoFuente: infoFuente };
+    return datos;
   }
 
   // ==========================================================================
   // PERSONAS Y MATRIZ
   // ==========================================================================
 
-  function construirPersonas(roster, res) {
+  function construirPersonas(roster, acc, datos) {
+    function horarioDe(rut) { return acc.horario[rut] ? acc.horario[rut][1] : '-'; }
     var enMaestro = {};
     var personas = roster.map(function (p) {
       enMaestro[p.RUT] = true;
@@ -717,7 +972,7 @@ var AsistenciaAnual = (function () {
         RUT: p.RUT,
         'Nombre completo': nombreDeFila(p),
         'Área': p['Área'] || '',
-        'Horario Turno': res.horario[p.RUT] ? res.horario[p.RUT].valor : '-',
+        'Horario Turno': horarioDe(p.RUT),
         'Recinto': p['Recinto'] || '',
         'Localidad': calcularLocalidad(p['Recinto']),
         'Supervisor': p['Supervisor'] || '',
@@ -726,18 +981,23 @@ var AsistenciaAnual = (function () {
     });
 
     if (CONFIG_ANUAL.INCLUIR_FUERA_DE_MAESTRO) {
-      var extra = Object.keys(res.infoFuente).filter(function (rut) { return !enMaestro[rut]; });
+      // Solo quienes tienen algún registro en el año reportado.
+      var conDatos = {};
+      Object.keys(datos).forEach(function (f) {
+        Object.keys(datos[f]).forEach(function (rut) { conDatos[rut] = true; });
+      });
+      var extra = Object.keys(conDatos).filter(function (rut) { return !enMaestro[rut] && acc.fuente[rut]; });
       extra.sort();
       extra.forEach(function (rut) {
-        var r = res.infoFuente[rut].fila;
+        var src = acc.fuente[rut]; // [fecha, nombre, area, recinto, supervisor]
         personas.push({
           RUT: rut,
-          'Nombre completo': nombreDeFila(r),
-          'Área': r['Área'] || '',
-          'Horario Turno': res.horario[rut] ? res.horario[rut].valor : '-',
-          'Recinto': r['Recinto'] || '',
-          'Localidad': calcularLocalidad(r['Recinto']),
-          'Supervisor': r['Supervisor'] || '',
+          'Nombre completo': src[1],
+          'Área': src[2],
+          'Horario Turno': horarioDe(rut),
+          'Recinto': src[3],
+          'Localidad': calcularLocalidad(src[3]),
+          'Supervisor': src[4],
           'En maestro': 'No'
         });
       });
@@ -1046,7 +1306,7 @@ var AsistenciaAnual = (function () {
   // CORREO
   // ==========================================================================
 
-  function enviarCorreo(anio, fechas, personas, matriz, archivo) {
+  function enviarCorreo(anio, fechas, personas, matriz, archivo, errores) {
     if (!CONFIG_ANUAL.CORREOS.length) return;
     var faltas = 0, retardos = 0;
     matriz.forEach(function (fila) {
@@ -1062,6 +1322,8 @@ var AsistenciaAnual = (function () {
       + '(del ' + fechas[0] + ' al ' + fechas[fechas.length - 1] + ', ' + personas.length + ' personas).</p>'
       + '<p>Faltas sin justificar: <strong>' + faltas + '</strong> · Retardos: <strong>' + retardos + '</strong></p>'
       + '<p>Archivo: <a href="' + archivo.getUrl() + '">' + archivo.getName() + '</a></p>'
+      + (errores.length ? ('<p style="color:#a00;">Archivos que no se pudieron leer (' + errores.length + '): '
+        + errores.join('<br>') + '</p>') : '')
       + '<p>Saludos cordiales.</p>'
       + '</div>';
     MailApp.sendEmail({
@@ -1072,5 +1334,5 @@ var AsistenciaAnual = (function () {
     Logger.log('Correo enviado a ' + CONFIG_ANUAL.CORREOS.join(', '));
   }
 
-  return { generar: generar, diagnosticar: diagnosticar };
+  return { ejecutar: ejecutar, reiniciar: reiniciar, diagnosticar: diagnosticar };
 })();
